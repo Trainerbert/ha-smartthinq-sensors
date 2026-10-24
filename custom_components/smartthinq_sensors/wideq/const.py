@@ -32,6 +32,13 @@ class AirConditionerFeatures(StrEnum):
     """Features for LG Air Conditioner devices."""
 
     ENERGY_CURRENT = "energy_current"
+    THERMAL_POWER = "thermal_power"
+    ENERGY_MONTH = "energy_month"
+    HEAT_ENERGY_MONTH = "heat_energy_month"
+    ENERGY_PERIOD = "energy_period"
+    ENERGY_RESET = "energy_reset"
+    ENERGY_UPDATED = "energy_updated"
+    ENERGY_STATUS = "energy_status"
     HOT_WATER_TEMP = "hot_water_temperature"
     HUMIDITY = "humidity"
     FILTER_MAIN_LIFE = "filter_main_life"

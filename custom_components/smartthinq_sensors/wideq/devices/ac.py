@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 import logging
+import math
 
 from ..backports.functools import cached_property
 from ..const import AirConditionerFeatures, TemperatureUnit
@@ -13,6 +14,7 @@ from ..core_util import TempUnitConversion
 from ..device import Device, DeviceStatus
 from ..device_info import DeviceInfo
 from ..model_info import TYPE_RANGE
+from .awhp_energy import AwhpEnergyHistory
 
 AWHP_MODEL_TYPE = ["AWHP", "SAC_AWHP"]
 
@@ -293,6 +295,8 @@ class AirConditionerDevice(Device):
 
         self._temperature_step = TEMP_STEP_WHOLE
         self._duct_zones = {}
+
+        self._energy_history = AwhpEnergyHistory()
 
         self._current_power = None
         self._current_power_supported = True
@@ -735,7 +739,15 @@ class AirConditionerDevice(Device):
         """Set the device's target temperature in Celsius degrees."""
         range_info = self._temperature_range
         conv_temp = self._f2c(temp)
-        if range_info and not (range_info[0] <= conv_temp <= range_info[1]):
+        # In AWHP AI mode these values encode an offset, not a water target.
+        # Keep ordinary temperature validation in every other operating mode.
+        awhp_ai_offset = (
+            self.is_air_to_water
+            and self._status is not None
+            and self._status.operation_mode == ACMode.AI.name
+            and 12 <= conv_temp <= 22
+        )
+        if not awhp_ai_offset and range_info and not (range_info[0] <= conv_temp <= range_info[1]):
             raise ValueError(f"Target temperature out of range: {temp}")
         keys = self._get_cmd_keys(CMD_STATE_TARGET_TEMP)
         await self.set(keys[0], keys[1], key=keys[2], value=conv_temp)
@@ -812,6 +824,10 @@ class AirConditionerDevice(Device):
             raise ValueError(f"Target temperature out of range: {temp}")
         keys = self._get_cmd_keys(CMD_STATE_HOT_WATER_TARGET_TEMP)
         await self.set(keys[0], keys[1], key=keys[2], value=conv_temp)
+
+    def set_energy_history_timezone(self, zone):
+        """Configure the local calendar for the app's monthly energy history."""
+        self._energy_history.set_timezone(zone)
 
     async def get_power(self):
         """Get the instant power usage in watts of the whole unit."""
@@ -937,6 +953,12 @@ class AirConditionerDevice(Device):
         )
         if not res:
             return None
+
+        # Separate app history; failures are isolated from the climate state.
+        if self.is_air_to_water and not self._should_poll and not self.client.emulation:
+            await self._energy_history.async_update(
+                self._client.session, self._device_info.device_id
+            )
 
         # update power for ACv1
         if self._should_poll and not self.is_air_to_water:
@@ -1162,6 +1184,44 @@ class AirConditionerStatus(DeviceStatus):
             # decrease power for devices that always return 50 when standby
             value = 5
         return self._update_feature(AirConditionerFeatures.ENERGY_CURRENT, value, False)
+
+    @property
+    def thermal_power(self):
+        """Return AWHP heat output in W, as in the app's live power display."""
+        if not (self._device.is_air_to_water and self.is_info_v2):
+            return None
+        key = "airState.calorie.onCurrent"
+        if key not in self._data and AirConditionerFeatures.THERMAL_POWER not in self._device.available_features:
+            return None
+        try:
+            value = self._data.get(key)
+            value = None if value is None or isinstance(value, bool) else float(value)
+            if value is not None and not math.isfinite(value):
+                value = None
+        except (TypeError, ValueError):
+            value = None
+        if value is not None:
+            value = max(value, 0)
+            if not self.is_on and self.is_hot_water_on is False:
+                value = 0
+        return self._update_feature(
+            AirConditionerFeatures.THERMAL_POWER, value, False, allow_none=True
+        )
+
+    def _update_awhp_energy_features(self):
+        """Expose history sensors even while the first request is pending."""
+        if not (self._device.is_air_to_water and self.is_info_v2):
+            return
+        values = self._device._energy_history.data
+        for feature, field in (
+            (AirConditionerFeatures.ENERGY_MONTH, "electricity"),
+            (AirConditionerFeatures.HEAT_ENERGY_MONTH, "heat"),
+            (AirConditionerFeatures.ENERGY_PERIOD, "month"),
+            (AirConditionerFeatures.ENERGY_RESET, "reset"),
+            (AirConditionerFeatures.ENERGY_UPDATED, "updated"),
+            (AirConditionerFeatures.ENERGY_STATUS, "status"),
+        ):
+            self._update_feature(feature, values.get(field), False, allow_none=True)
 
     @property
     def humidity(self):
@@ -1391,6 +1451,7 @@ class AirConditionerStatus(DeviceStatus):
         _ = [
             self.room_temp,
             self.energy_current,
+            self.thermal_power,
             self.filters_life,
             self.humidity,
             self.pm10,
@@ -1405,3 +1466,4 @@ class AirConditionerStatus(DeviceStatus):
             self.hot_water_current_temp,
             self.reservation_sleep_time,
         ]
+        self._update_awhp_energy_features()

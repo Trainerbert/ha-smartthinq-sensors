@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 import logging
 from typing import Any, Callable
 
@@ -21,6 +21,7 @@ from homeassistant.const import (
     PERCENTAGE,
     STATE_UNAVAILABLE,
     EntityCategory,
+    UnitOfEnergy,
     UnitOfPower,
     UnitOfTime,
 )
@@ -30,6 +31,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback, current_platform
 from homeassistant.helpers.typing import UNDEFINED
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import LGEDevice
 from .const import (
@@ -258,6 +260,40 @@ AC_SENSORS: tuple[ThinQSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         device_class=SensorDeviceClass.POWER,
         native_unit_of_measurement=UnitOfPower.WATT,
+    ),
+    ThinQSensorEntityDescription(
+        key=AirConditionerFeatures.THERMAL_POWER,
+        name="Wärmeleistung",
+        state_class=SensorStateClass.MEASUREMENT,
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        suggested_display_precision=0,
+    ),
+    ThinQSensorEntityDescription(
+        key=AirConditionerFeatures.ENERGY_MONTH,
+        name="Stromverbrauch Monat",
+        state_class=SensorStateClass.TOTAL,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=2,
+        feature_attributes={
+            "period": AirConditionerFeatures.ENERGY_PERIOD,
+            "last_update": AirConditionerFeatures.ENERGY_UPDATED,
+            "history_status": AirConditionerFeatures.ENERGY_STATUS,
+        },
+    ),
+    ThinQSensorEntityDescription(
+        key=AirConditionerFeatures.HEAT_ENERGY_MONTH,
+        name="Wärmemenge Monat",
+        state_class=SensorStateClass.TOTAL,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=2,
+        feature_attributes={
+            "period": AirConditionerFeatures.ENERGY_PERIOD,
+            "last_update": AirConditionerFeatures.ENERGY_UPDATED,
+            "history_status": AirConditionerFeatures.ENERGY_STATUS,
+        },
     ),
     ThinQSensorEntityDescription(
         key=AirConditionerFeatures.HUMIDITY,
@@ -590,6 +626,13 @@ async def async_setup_entry(
         if not lge_devices:
             return
 
+        # The app's calendar must follow HA's configured timezone, not the
+        # container's often-UTC system clock. History starts on the next poll.
+        zone = dt_util.get_time_zone(hass.config.time_zone)
+        if zone is not None:
+            for lge_device in lge_devices.get(DeviceType.AC, []):
+                lge_device.device.set_energy_history_timezone(zone)
+
         lge_sensors = [
             LGESensor(lge_device, sensor_desc, get_wrapper_device(lge_device, dev_type))
             for dev_type, sensor_descs in SENSOR_ENTITIES.items()
@@ -651,6 +694,7 @@ class LGESensor(CoordinatorEntity, SensorEntity):
         """Initialize the sensor."""
         super().__init__(api.coordinator)
         self._api = api
+        self._energy_last_reset: datetime | None = None
         self._wrap_device = wrapped_device
         self.entity_description = description
         self._attr_unique_id = api.unique_id
@@ -677,6 +721,23 @@ class LGESensor(CoordinatorEntity, SensorEntity):
         if not self.available:
             return STATE_UNAVAILABLE
         return self._get_sensor_state()
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Explicit monthly reset; cloud corrections must not count as a reset."""
+        if self.entity_description.key not in (
+            AirConditionerFeatures.ENERGY_MONTH,
+            AirConditionerFeatures.HEAT_ENERGY_MONTH,
+        ):
+            return None
+        if self._api.state:
+            features = self._api.state.device_features
+            stamp = features.get(AirConditionerFeatures.ENERGY_RESET)
+            # HA requires a numeric state when last_reset changes. During a
+            # failed/empty request retain the last valid reset of this entity.
+            if features.get(self.entity_description.key) is not None and stamp:
+                self._energy_last_reset = datetime.fromisoformat(stamp)
+        return self._energy_last_reset
 
     @property
     def native_unit_of_measurement(self) -> str | None:

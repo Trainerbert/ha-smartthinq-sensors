@@ -47,6 +47,12 @@ ATTR_FRIDGE = "fridge"
 ATTR_FREEZER = "freezer"
 HVAC_MODE_NONE = "--"
 
+# AWHP AI encodes -5..+5 as 12..22; neutral offset is 17.
+# Adapted from Trainerbert's upstream pull request #923.
+AWHP_AI_BASE = 17
+AWHP_AI_MIN = -5
+AWHP_AI_MAX = 5
+
 # service definitions
 SERVICE_SET_SLEEP_TIME = "set_sleep_time"
 
@@ -270,6 +276,8 @@ class LGEACClimate(LGEClimate):
     @property
     def target_temperature_step(self) -> float:
         """Return the supported step of target temperature."""
+        if self._is_awhp_ai_offset_mode():
+            return 1.0
         return self._device.target_temperature_step
 
     @property
@@ -278,6 +286,14 @@ class LGEACClimate(LGEClimate):
         if self._device.temperature_unit == TemperatureUnit.FAHRENHEIT:
             return UnitOfTemperature.FAHRENHEIT
         return UnitOfTemperature.CELSIUS
+
+    def _is_awhp_ai_offset_mode(self) -> bool:
+        """Return whether the AWHP exposes an encoded Celsius AI offset."""
+        return (
+            self._device.is_air_to_water
+            and self._api.state.operation_mode == ACMode.AI.name
+            and self.temperature_unit == UnitOfTemperature.CELSIUS
+        )
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -361,7 +377,10 @@ class LGEACClimate(LGEClimate):
     @property
     def target_temperature(self) -> float:
         """Return the temperature we try to reach."""
-        return self._api.state.target_temp
+        temp = self._api.state.target_temp
+        if temp is not None and self._is_awhp_ai_offset_mode():
+            return int(round(float(temp) - AWHP_AI_BASE))
+        return temp
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set new target temperature."""
@@ -371,6 +390,9 @@ class LGEACClimate(LGEClimate):
                 return
 
         if (new_temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
+            if self._is_awhp_ai_offset_mode():
+                offset = max(AWHP_AI_MIN, min(AWHP_AI_MAX, int(round(float(new_temp)))))
+                new_temp = offset + AWHP_AI_BASE
             await self._device.set_target_temp(new_temp)
             self._api.async_set_updated()
 
@@ -436,6 +458,8 @@ class LGEACClimate(LGEClimate):
     @property
     def min_temp(self) -> float:
         """Return the minimum temperature."""
+        if self._is_awhp_ai_offset_mode():
+            return float(AWHP_AI_MIN)
         if (min_value := self._device.target_temperature_min) is not None:
             return min_value
         return self._device.conv_temp_unit(
@@ -445,6 +469,8 @@ class LGEACClimate(LGEClimate):
     @property
     def max_temp(self) -> float:
         """Return the maximum temperature."""
+        if self._is_awhp_ai_offset_mode():
+            return float(AWHP_AI_MAX)
         if (max_value := self._device.target_temperature_max) is not None:
             return max_value
         return self._device.conv_temp_unit(
